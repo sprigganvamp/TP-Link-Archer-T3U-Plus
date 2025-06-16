@@ -1,0 +1,116 @@
+
+```bash
+#!/bin/bash
+set -e
+
+echo "============================"
+echo " Proxmox Wi-Fi Setup Script"
+echo "============================"
+echo
+
+# 1. INSTALL REQUIRED PACKAGES
+echo "[+] Updating and installing packages..."
+apt update
+apt install -y wireless-tools wpasupplicant net-tools iw rfkill resolvconf crda ntp bridge-utils
+
+# 2. UNBLOCK WIFI IN CASE OF BLOCKED STATE
+echo "[+] Unblocking Wi-Fi (rfkill)..."
+modprobe rfkill || true
+rfkill unblock wifi || true
+rfkill unblock all || true
+
+# 3. ENABLE DNS + TIME SYNC (Required for WPA3 auth)
+echo "[+] Enabling time sync and DNS..."
+systemctl enable --now resolvconf
+systemctl enable --now ntp
+
+# 4. DETECT WIFI ADAPTER MAC
+echo "[+] Detecting Wi-Fi adapter..."
+WIFI_IFACE=$(ip link | grep -oP 'wlx[\w\d:]+' | head -1)
+if [[ -z "$WIFI_IFACE" ]]; then
+  echo "[-] No Wi-Fi interface starting with 'wlx' found!"
+  exit 1
+fi
+
+WIFI_MAC=$(cat /sys/class/net/$WIFI_IFACE/address)
+echo "    Found interface: $WIFI_IFACE with MAC $WIFI_MAC"
+
+# 5. RENAME INTERFACE TO wlan0
+echo "[+] Renaming interface to wlan0..."
+cat <<EOF > /etc/udev/rules.d/70-persistent-net.rules
+SUBSYSTEM=="net", ACTION=="add", DRIVERS=="?*", ATTR{address}=="$WIFI_MAC", NAME="wlan0"
+EOF
+
+# 6. CONFIGURE WPA SUPPLICANT WITH GIVEN SSID/PASS
+read -rp "Enter the SSID of the Wi-Fi network: " SSID
+read -rsp "Enter the password of the Wi-Fi network: " PASS
+echo
+
+cat <<EOF > /etc/wpa_supplicant/wpa_supplicant-wlan0.conf
+ctrl_interface=DIR=/var/run/wpa_supplicant GROUP=netdev
+update_config=1
+country=IN
+
+network={
+    ssid="$SSID"
+    psk="$PASS"
+    key_mgmt=WPA-PSK SAE
+    scan_ssid=1
+    priority=5
+    bgscan="simple:30:-70:300"
+}
+EOF
+
+chmod 600 /etc/wpa_supplicant/wpa_supplicant-wlan0.conf
+
+# 7. CREATE SYSTEMD SERVICE TO AUTOSTART
+echo "[+] Creating systemd service for auto-connection..."
+cat <<EOF > /etc/systemd/system/wifi-connect.service
+[Unit]
+Description=WPA Supplicant for wlan0
+After=network.target
+
+[Service]
+ExecStart=/sbin/wpa_supplicant -i wlan0 -c /etc/wpa_supplicant/wpa_supplicant-wlan0.conf -D nl80211,wext
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl enable wifi-connect.service
+
+# 8. BACKUP EXISTING INTERFACES FILE
+echo "[+] Backing up /etc/network/interfaces..."
+cp /etc/network/interfaces /etc/network/interfaces.bak_$(date +%F_%T)
+
+# 9. CREATE BRIDGE CONFIG FOR vmbr0 + wlan0
+echo "[+] Writing new /etc/network/interfaces config..."
+cat <<EOF > /etc/network/interfaces
+auto lo
+iface lo inet loopback
+
+allow-hotplug wlan0
+iface wlan0 inet manual
+    wpa-conf /etc/wpa_supplicant/wpa_supplicant-wlan0.conf
+
+auto vmbr0
+iface vmbr0 inet dhcp
+    bridge_ports wlan0
+    bridge_stp off
+    bridge_fd 0
+EOF
+
+# 10. FINISH
+echo
+echo "[✓] Setup complete!"
+echo "You may now reboot the server to apply changes."
+read -rp "Do you want to reboot now? (y/N): " confirm
+if [[ "$confirm" =~ ^[Yy]$ ]]; then
+    reboot
+else
+    echo "[*] Please reboot manually to activate Wi-Fi interface (wlan0) with Proxmox bridge (vmbr0)."
+fi
+```
+.
